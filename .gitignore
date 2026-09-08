@@ -1,0 +1,37 @@
+# Compiled test binaries and cover profiles
+*.test
+*.out
+*.prof
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Database test files generated locally
+*.accdb
+*.mdb
+*.laccdb
+*.ldb
+
+# Maven / Java (if any test artifacts)
+target/
+.m2/
+
+# Temp files
+*.tmp
+.accdb-*.tmp
+coverage.txt

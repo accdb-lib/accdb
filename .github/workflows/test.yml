@@ -1,0 +1,51 @@
+name: Test & Lint
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test & Lint (Go ${{ matrix.go-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: [ '1.21', '1.22', '1.23', '1.24' ]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+
+      - name: Check Formatting
+        run: |
+          diffs=$(gofmt -l .)
+          if [ -n "$diffs" ]; then
+            echo "Unformatted files found:"
+            echo "$diffs"
+            exit 1
+          fi
+
+      - name: Go Vet
+        run: go vet ./...
+
+      - name: Run Unit Tests & Race Detection
+        run: go test -v -race -coverprofile=coverage.txt ./...
+
+      - name: Smoke Fuzz Tests (15s each)
+        run: |
+          go test -fuzz=FuzzParseHeader -fuzztime=15s .
+          go test -fuzz=FuzzDecodeRow -fuzztime=15s .
+
+      - name: Verify Pure Go Build (CGO_ENABLED=0)
+        run: CGO_ENABLED=0 go build -v ./...
