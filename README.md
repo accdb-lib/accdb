@@ -6,11 +6,17 @@
 An idiomatic, **Pure Go** storage and query engine for Microsoft Access database files (`.accdb`).
 
 > [!WARNING]
-> **Status: Experimental Alpha (WIP)**
+> **Status: Experimental Alpha**
 >
-> Do not use this library as the sole copy of critical production data.
-> Currently, creation and writes are strictly restricted to verified **ACE/ACCDB (Access 2007+)** formats.
-> Access Encryption, Long Values (OLE/Memo > 4KB), and multi-page B-tree index splits are **not implemented** and explicitly return `ErrNotImplemented`.
+> `accdb` is a Pure Go implementation for **ACE/ACCDB (Access 2007+)** files.
+> Core create, read, insert, update, delete, and drop-table operations are covered
+> by Go tests and have been manually verified with UCanAccess 5.0.1.
+>
+> This release is not production-ready. Keep independent backups and do not use it
+> as the only copy of critical data. Access encryption, reference usage maps beyond
+> data page 511, and multi-page B-tree index splits are not supported. Operations
+> outside these documented limits return an error rather than silently writing an
+> unsupported structure.
 
 ---
 
@@ -25,8 +31,8 @@ An idiomatic, **Pure Go** storage and query engine for Microsoft Access database
 | **Delete Rows** | :white_check_mark: Yes | :white_check_mark: Yes | Unit & Regression Tests | ACE slotted delete (`0xC000` flags), index sync |
 | **Drop Table** | :white_check_mark: Yes | :white_check_mark: Yes | Unit & Regression Tests | Catalog removal & cascade child cleanup |
 | **Primary Key & Index Seek** | :white_check_mark: Yes | :white_check_mark: Yes | Unit & Regression Tests | Root leaf-page binary seek |
+| **Long Values (OLE/Memo)** | :white_check_mark: Yes | :white_check_mark: Yes | Unit & UCanAccess Tests | Inline, Single-page, and Multi-page chained records |
 | **Multi-page Index (B-Tree)** | :x: No | :x: No | Spec Reference | Returns `ErrIndexPageFull` if page full |
-| **Long Values (> 4KB OLE/Memo)** | :x: No | :x: No | Spec Reference | Returns `ErrNotImplemented` |
 | **Access Encryption** | :x: No | :x: No | Unit Tests | Returns `ErrNotImplemented` |
 | **Jet 3 / Jet 4 (.mdb)** | :warning: Partial | :x: No | Spec Reference | `Create()` rejects legacy versions |
 
@@ -148,6 +154,37 @@ if err != nil {
 for _, row := range result.Rows {
 	fmt.Println(row["FirstName"], row["LastName"])
 }
+```
+
+### 4. In-Memory Databases & Byte Streaming (Zero Disk I/O)
+
+Ideal for serverless, microservices, cloud storage (S3/GCS), or dynamic HTTP file downloads:
+
+```go
+// 1. Create a database entirely in memory (no physical file created on disk)
+db, err := accdb.CreateInMemory(accdb.JetVersion5)
+if err != nil {
+	log.Fatal(err)
+}
+defer db.Close()
+
+// Create tables, insert records, build indexes in memory...
+
+// 2. Export database directly as []byte
+dbBytes, err := db.Bytes()
+if err != nil {
+	log.Fatal(err)
+}
+
+// 3. Or stream directly to any io.Writer (e.g. http.ResponseWriter, bytes.Buffer)
+// _, err = db.WriteTo(w)
+
+// 4. Open an Access database directly from a memory slice (without writing to disk)
+opened, err := accdb.OpenBytes(dbBytes)
+if err != nil {
+	log.Fatal(err)
+}
+defer opened.Close()
 ```
 
 ---

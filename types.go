@@ -16,7 +16,8 @@ type Database struct {
 	encrypted bool
 	encType   EncryptionType
 	password  string
-	readOnly  bool
+	readOnly         bool
+	maxLongValueSize int64
 
 	// Internal state
 	data      []byte

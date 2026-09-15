@@ -24,22 +24,51 @@ var (
 	ErrDatabaseTooLarge   = errors.New("database file exceeds maximum allowed size")
 	ErrReadOnly           = errors.New("database is read-only")
 	ErrNumericOverflow    = errors.New("numeric value overflows column range")
+	ErrLongValueTooLarge  = errors.New("long value exceeds maximum allowed size")
 )
 
 // OpenOptions configures how database files are opened
 type OpenOptions struct {
-	MaxFileSize int64
-	ReadOnly    bool
+	MaxFileSize     int64
+	MaxLongValueSize int64
+	ReadOnly        bool
 }
 
-// DefaultMaxFileSize limits memory usage to 1 GiB during initial Alpha
-const DefaultMaxFileSize = 1 << 30 // 1 GiB
+// Resource limit defaults
+const (
+	DefaultMaxFileSize     = 1 << 30 // 1 GiB limits memory usage during initial Alpha
+	DefaultMaxLongValueSize = 64 << 20 // 64 MiB
+)
 
 // Open opens an existing Access database file using default options
 func Open(path string) (*Database, error) {
 	return OpenWithOptions(path, OpenOptions{
 		MaxFileSize: DefaultMaxFileSize,
 	})
+}
+
+// OpenBytes opens an Access database directly from an in-memory byte slice using default options
+func OpenBytes(data []byte) (*Database, error) {
+	return OpenBytesWithOptions(data, OpenOptions{
+		MaxFileSize: DefaultMaxFileSize,
+	})
+}
+
+// OpenBytesWithOptions opens an Access database directly from an in-memory byte slice with explicit resource limits
+func OpenBytesWithOptions(data []byte, options OpenOptions) (*Database, error) {
+	if options.MaxFileSize <= 0 {
+		options.MaxFileSize = DefaultMaxFileSize
+	}
+	if int64(len(data)) > options.MaxFileSize {
+		return nil, fmt.Errorf("%w: byte slice size %d exceeds limit %d", ErrDatabaseTooLarge, len(data), options.MaxFileSize)
+	}
+	if len(data) < 2048 {
+		return nil, ErrInvalidFile
+	}
+
+	buf := make([]byte, len(data))
+	copy(buf, data)
+	return loadDatabaseFromBuffer("", buf, options)
 }
 
 // OpenWithOptions opens an Access database with explicit resource limits
@@ -81,12 +110,23 @@ func OpenWithOptions(path string, options OpenOptions) (*Database, error) {
 		return nil, ErrInvalidFile
 	}
 
+	return loadDatabaseFromBuffer(path, data, options)
+}
+
+// loadDatabaseFromBuffer parses and initializes a Database from an existing memory buffer
+func loadDatabaseFromBuffer(path string, data []byte, options OpenOptions) (*Database, error) {
+	maxLVal := options.MaxLongValueSize
+	if maxLVal <= 0 {
+		maxLVal = DefaultMaxLongValueSize
+	}
+
 	db := &Database{
-		path:     path,
-		data:     data,
-		readOnly: options.ReadOnly,
-		encoding: binary.LittleEndian,
-		tables:   make(map[string]*Table),
+		path:             path,
+		data:             data,
+		readOnly:         options.ReadOnly,
+		maxLongValueSize: maxLVal,
+		encoding:         binary.LittleEndian,
+		tables:           make(map[string]*Table),
 	}
 
 	if err := db.parseHeader(); err != nil {
@@ -145,11 +185,12 @@ func (db *Database) initUsageMapFromLoaded() error {
 	return nil
 }
 
-// Create creates a new Access database file.
+// Create creates a new Access database. If path is non-empty, it validates the .accdb extension.
+// If path is empty, it creates an in-memory database without filesystem binding.
 // In Alpha, creation is strictly limited to verified ACE/ACCDB (JetVersion5).
 func Create(path string, version JetVersion) (*Database, error) {
-	if version != JetVersion5 {
-		return nil, fmt.Errorf("%w: only ACE/ACCDB (JetVersion5) is currently supported for creation", ErrUnsupportedVersion)
+	if path == "" {
+		return CreateInMemory(version)
 	}
 
 	ext := filepath.Ext(path)
@@ -157,17 +198,32 @@ func Create(path string, version JetVersion) (*Database, error) {
 		return nil, errors.New("ACE database must use .accdb extension")
 	}
 
+	return createDatabase(path, version)
+}
+
+// CreateInMemory creates a new in-memory Access database without creating any physical file on disk.
+func CreateInMemory(version JetVersion) (*Database, error) {
+	return createDatabase("", version)
+}
+
+// createDatabase initializes an empty Access database structure in memory
+func createDatabase(path string, version JetVersion) (*Database, error) {
+	if version != JetVersion5 {
+		return nil, fmt.Errorf("%w: only ACE/ACCDB (JetVersion5) is currently supported for creation", ErrUnsupportedVersion)
+	}
+
 	pageSize := PageSizeJet5
 
 	db := &Database{
-		path:       path,
-		version:    version,
-		profile:    GetFormatProfile(version),
-		pageSize:   pageSize,
-		encoding:   binary.LittleEndian,
-		tables:     make(map[string]*Table),
-		createdAt:  time.Now(),
-		modifiedAt: time.Now(),
+		path:             path,
+		version:          version,
+		profile:          GetFormatProfile(version),
+		pageSize:         pageSize,
+		encoding:         binary.LittleEndian,
+		tables:           make(map[string]*Table),
+		createdAt:        time.Now(),
+		modifiedAt:       time.Now(),
+		maxLongValueSize: DefaultMaxLongValueSize,
 	}
 
 	// Initialize empty database
@@ -725,20 +781,53 @@ func (db *Database) readInlineUsageMap(pageNum uint32, rowNum byte) []uint32 {
 	if rowOffsetPos+2 > len(page) {
 		return nil
 	}
-	rowStart := int(readUint16(page, rowOffsetPos) & 0x0FFF)
-	if rowStart+69 > len(page) || page[rowStart] != 0x00 {
+	rowStart := int(readUint16(page, rowOffsetPos) & 0x1FFF)
+	if rowStart >= len(page) {
 		return nil
 	}
-	startPage := readUint32(page, rowStart+1)
-	var pages []uint32
-	for byteIndex, bits := range page[rowStart+5 : rowStart+69] {
-		for bit := uint(0); bit < 8; bit++ {
-			if bits&(1<<bit) != 0 {
-				pages = append(pages, startPage+uint32(byteIndex*8)+uint32(bit))
+
+	mapType := page[rowStart]
+	if mapType == 0x00 { // Inline usage map
+		if rowStart+69 > len(page) {
+			return nil
+		}
+		startPage := readUint32(page, rowStart+1)
+		var pages []uint32
+		for byteIndex, bits := range page[rowStart+5 : rowStart+69] {
+			for bit := uint(0); bit < 8; bit++ {
+				if bits&(1<<bit) != 0 {
+					pages = append(pages, startPage+uint32(byteIndex*8)+uint32(bit))
+				}
 			}
 		}
+		return pages
+	} else if mapType == 0x01 { // Reference usage map
+		if rowStart+5 > len(page) {
+			return nil
+		}
+		refPageNum := readUint32(page, rowStart+1)
+		if refPageNum == 0 || int(refPageNum+1)*db.pageSize > len(db.data) {
+			return nil
+		}
+		refPage := db.data[int(refPageNum)*db.pageSize : int(refPageNum+1)*db.pageSize]
+		if refPage[0] != byte(PageTypePageUsage) {
+			return nil
+		}
+		var pages []uint32
+		bitmap := refPage[4:]
+		for byteIndex, bits := range bitmap {
+			if bits == 0 {
+				continue
+			}
+			for bit := uint(0); bit < 8; bit++ {
+				if bits&(1<<bit) != 0 {
+					pages = append(pages, uint32(byteIndex*8)+uint32(bit))
+				}
+			}
+		}
+		return pages
 	}
-	return pages
+	return nil
 }
 
 // loadTablesFromMSysObjects loads table information from MSysObjects
@@ -832,13 +921,17 @@ func atomicWriteFile(path string, data []byte) error {
 	return nil
 }
 
-// Save writes the database to disk atomically after verifying writable status and validation
+// Save writes the database to disk atomically after verifying writable status and validation.
+// For in-memory databases (path == ""), Save returns an error recommending SaveAs(path) or Bytes().
 func (db *Database) Save() error {
 	if err := db.ensureWritable(); err != nil {
 		return err
 	}
 	if err := db.Validate(); err != nil {
 		return err
+	}
+	if db.path == "" {
+		return errors.New("cannot save in-memory database without destination path; use SaveAs(path) or Bytes()")
 	}
 	return atomicWriteFile(db.path, db.data)
 }
@@ -856,6 +949,41 @@ func (db *Database) SaveAs(path string) error {
 	}
 	db.path = path
 	return nil
+}
+
+// Bytes returns an independent defensive copy of the database's binary representation.
+// It runs Validate() before returning to guarantee consistency.
+func (db *Database) Bytes() ([]byte, error) {
+	if db == nil || len(db.data) == 0 {
+		return nil, ErrInvalidData
+	}
+	if err := db.Validate(); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, len(db.data))
+	copy(buf, db.data)
+	return buf, nil
+}
+
+// WriteTo writes the database's binary representation to an io.Writer.
+// It implements io.WriterTo and validates the database before writing.
+func (db *Database) WriteTo(w io.Writer) (int64, error) {
+	if db == nil || len(db.data) == 0 {
+		return 0, ErrInvalidData
+	}
+	if err := db.Validate(); err != nil {
+		return 0, err
+	}
+	n, err := w.Write(db.data)
+	return int64(n), err
+}
+
+// IsInMemory returns whether the database is operating strictly in-memory without a bound file path.
+func (db *Database) IsInMemory() bool {
+	if db == nil {
+		return false
+	}
+	return db.path == ""
 }
 
 // IsReadOnly returns whether the database was opened in read-only mode
@@ -891,9 +1019,10 @@ func (db *Database) deepClone() (*Database, error) {
 		codePage:   db.codePage,
 		encrypted:  db.encrypted,
 		encType:    db.encType,
-		password:   db.password,
-		readOnly:   db.readOnly,
-		data:       cloneData,
+		password:         db.password,
+		readOnly:         db.readOnly,
+		maxLongValueSize: db.maxLongValueSize,
+		data:             cloneData,
 		tables:     make(map[string]*Table),
 		createdAt:  db.createdAt,
 		modifiedAt: time.Now(),

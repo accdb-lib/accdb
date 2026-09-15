@@ -40,6 +40,21 @@ func (idx *Index) EncodeKey(values map[string]interface{}) ([]byte, error) {
 		}
 
 		val := values[col.Name]
+		if val == nil {
+			if idxCol.Ascending {
+				keyBuf.WriteByte(0x00) // ASC_NULL_FLAG
+			} else {
+				keyBuf.WriteByte(0xFF) // DESC_NULL_FLAG
+			}
+			continue
+		}
+
+		if idxCol.Ascending {
+			keyBuf.WriteByte(0x7F) // ASC_START_FLAG
+		} else {
+			keyBuf.WriteByte(0x80) // DESC_START_FLAG
+		}
+
 		codec := GetCodec(col.Type)
 		colKey, err := codec.EncodeKey(val, col)
 		if err != nil {
@@ -74,6 +89,16 @@ func (idx *Index) EncodeKeyFromValue(val interface{}) ([]byte, error) {
 	if col == nil {
 		return nil, errors.New("index column not found in table")
 	}
+	if val == nil {
+		if idx.Columns[0].Ascending {
+			return []byte{0x00}, nil
+		}
+		return []byte{0xFF}, nil
+	}
+	var prefix byte = 0x7F
+	if !idx.Columns[0].Ascending {
+		prefix = 0x80
+	}
 	codec := GetCodec(col.Type)
 	key, err := codec.EncodeKey(val, col)
 	if err != nil {
@@ -84,7 +109,7 @@ func (idx *Index) EncodeKeyFromValue(val interface{}) ([]byte, error) {
 			key[i] = ^key[i]
 		}
 	}
-	return key, nil
+	return append([]byte{prefix}, key...), nil
 }
 
 // ContainsKey returns true if the key already exists in the index
@@ -120,11 +145,11 @@ func (idx *Index) Insert(entry IndexEntry) error {
 
 	// Check page capacity if bound to a database page
 	if idx.Table != nil && idx.Table.db != nil && idx.RootPage != 0 {
-		required := 14
+		required := 480
 		for _, e := range idx.Entries {
-			required += 2 + len(e.Key) + 4 + 2
+			required += len(e.Key) + 4
 		}
-		required += 2 + len(entry.Key) + 4 + 2
+		required += len(entry.Key) + 4
 		if required > idx.Table.db.pageSize {
 			return ErrIndexPageFull
 		}
@@ -189,11 +214,11 @@ func (idx *Index) PrepareInsert(values map[string]interface{}, loc RowLocation) 
 	}
 
 	if idx.Table != nil && idx.Table.db != nil && idx.RootPage != 0 {
-		required := 14
+		required := 480
 		for _, e := range idx.Entries {
-			required += 2 + len(e.Key) + 4 + 2
+			required += len(e.Key) + 4
 		}
-		required += 2 + len(key) + 4 + 2
+		required += len(key) + 4
 		if required > idx.Table.db.pageSize {
 			return nil, ErrIndexPageFull
 		}
@@ -241,14 +266,14 @@ func (idx *Index) PrepareUpdate(oldValues, newValues map[string]interface{}, loc
 
 	// Check leaf page capacity for the diff
 	if idx.Table != nil && idx.Table.db != nil && idx.RootPage != 0 {
-		required := 14
+		required := 480
 		for _, e := range idx.Entries {
 			if bytes.Equal(e.Key, oldKey) && e.Location == loc {
 				continue
 			}
-			required += 2 + len(e.Key) + 4 + 2
+			required += len(e.Key) + 4
 		}
-		required += 2 + len(newKey) + 4 + 2
+		required += len(newKey) + 4
 		if required > idx.Table.db.pageSize {
 			return nil, ErrIndexPageFull
 		}
@@ -390,32 +415,50 @@ func (db *Database) writeIndexLeafPage(idx *Index) {
 	}
 	page := db.data[pageOffset : pageOffset+db.pageSize]
 
+	// Zero-fill leaf page
+	for i := range page {
+		page[i] = 0
+	}
+
 	// Header: PageTypeLeafIndex (0x04)
 	page[0] = byte(PageTypeLeafIndex)
-	page[1] = 0x00 // Leaf level
+	page[1] = 0x01 // Leaf level flag
 	if idx.Table != nil {
 		writeUint32(page, 4, idx.Table.ID)
 	}
-	writeUint16(page, 12, uint16(len(idx.Entries))) // Entry count
 
-	// Slotted layout or sequential entries:
-	// Entry: 2-byte key length + key bytes + 4-byte pageNum + 2-byte rowNum
-	offset := 14
+	entryMaskPos := 27
+	entryMaskLen := 453
+	entryPos := entryMaskPos + entryMaskLen // 480
+
+	totalSize := 0
 	for _, entry := range idx.Entries {
-		entrySize := 2 + len(entry.Key) + 4 + 2
-		if offset+entrySize > db.pageSize {
+		entrySize := len(entry.Key) + 4
+		if entryPos+totalSize+entrySize > db.pageSize {
 			break // fits in leaf page
 		}
-		writeUint16(page, offset, uint16(len(entry.Key)))
-		offset += 2
-		copy(page[offset:], entry.Key)
-		offset += len(entry.Key)
-		writeUint32(page, offset, entry.Location.PageNumber)
-		offset += 4
-		writeUint16(page, offset, entry.Location.RowNumber)
-		offset += 2
+
+		// Write key bytes
+		copy(page[entryPos+totalSize:], entry.Key)
+		// Write 3-byte BigEndian PageNumber + 1-byte RowNumber
+		page[entryPos+totalSize+len(entry.Key)] = byte(entry.Location.PageNumber >> 16)
+		page[entryPos+totalSize+len(entry.Key)+1] = byte(entry.Location.PageNumber >> 8)
+		page[entryPos+totalSize+len(entry.Key)+2] = byte(entry.Location.PageNumber)
+		page[entryPos+totalSize+len(entry.Key)+3] = byte(entry.Location.RowNumber)
+
+		totalSize += entrySize
+
+		// Mark end of entry in bitmap mask
+		byteIdx := totalSize / 8
+		bitIdx := totalSize % 8
+		if byteIdx < entryMaskLen {
+			page[entryMaskPos+byteIdx] |= (1 << bitIdx)
+		}
 	}
-	writeUint16(page, 2, uint16(db.pageSize-offset)) // Free space
+
+	// Update free space
+	freeSpace := uint16(db.pageSize - (entryPos + totalSize))
+	writeUint16(page, 2, freeSpace)
 }
 
 // readIndexLeafPage deserializes index entries from its leaf page
@@ -429,29 +472,38 @@ func (db *Database) readIndexLeafPage(pageNum uint32, idx *Index) {
 		return
 	}
 
-	entryCount := int(readUint16(page, 12))
-	offset := 14
-	for i := 0; i < entryCount && offset < db.pageSize-8; i++ {
-		keyLen := int(readUint16(page, offset))
-		offset += 2
-		if offset+keyLen+6 > db.pageSize {
-			break
+	entryMaskPos := 27
+	entryMaskLen := 453
+	entryPos := entryMaskPos + entryMaskLen // 480
+
+	lastStart := 0
+	for i := 0; i < entryMaskLen; i++ {
+		mask := page[entryMaskPos+i]
+		if mask == 0 {
+			continue
 		}
-		key := make([]byte, keyLen)
-		copy(key, page[offset:offset+keyLen])
-		offset += keyLen
+		for j := 0; j < 8; j++ {
+			if (mask & (1 << j)) != 0 {
+				end := i*8 + j
+				length := end - lastStart
+				if length >= 4 && entryPos+lastStart+length <= db.pageSize {
+					rawEntry := page[entryPos+lastStart : entryPos+lastStart+length]
+					key := make([]byte, length-4)
+					copy(key, rawEntry[:length-4])
 
-		pNum := readUint32(page, offset)
-		offset += 4
-		rNum := readUint16(page, offset)
-		offset += 2
+					pNum := (uint32(rawEntry[length-4]) << 16) | (uint32(rawEntry[length-3]) << 8) | uint32(rawEntry[length-2])
+					rNum := uint16(rawEntry[length-1])
 
-		idx.Entries = append(idx.Entries, IndexEntry{
-			Key: key,
-			Location: RowLocation{
-				PageNumber: pNum,
-				RowNumber:  rNum,
-			},
-		})
+					idx.Entries = append(idx.Entries, IndexEntry{
+						Key: key,
+						Location: RowLocation{
+							PageNumber: pNum,
+							RowNumber:  rNum,
+						},
+					})
+				}
+				lastStart = end
+			}
+		}
 	}
 }

@@ -35,3 +35,19 @@ target/
 *.tmp
 .accdb-*.tmp
 coverage.txt
+
+# Secrets, Environment & Credentials
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.cert
+*.crt
+credentials.json
+secrets.json
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub

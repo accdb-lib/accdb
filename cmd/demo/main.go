@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/accdb-lib/accdb"
@@ -34,6 +36,7 @@ func main() {
 			{Name: "CreditLimit", Type: accdb.ColTypeDouble, Nullable: true},
 			{Name: "RegisterDate", Type: accdb.ColTypeDateTime, Nullable: true},
 			{Name: "Active", Type: accdb.ColTypeBoolean, Nullable: false},
+			{Name: "Notes", Type: accdb.ColTypeMemo, Nullable: true},
 		},
 		Indexes: []accdb.IndexDef{
 			{Name: "PK_Customers", Columns: []string{"ID"}, Primary: true, Unique: true},
@@ -52,6 +55,7 @@ func main() {
 			"CreditLimit":   500000.0,
 			"RegisterDate":  time.Date(2023, 1, 15, 9, 30, 0, 0, time.UTC),
 			"Active":        true,
+			"Notes":         "ลูกค้าระดับ Gold มีประวัติการชำระเงินดีมาก ตรงต่อเวลาทุกงวด",
 		},
 		{
 			"CustomerCode":  "CUST-002",
@@ -60,6 +64,7 @@ func main() {
 			"CreditLimit":   250000.0,
 			"RegisterDate":  time.Date(2023, 3, 20, 14, 0, 0, 0, time.UTC),
 			"Active":        true,
+			"Notes":         "ห้างหุ้นส่วน วัฒนายนต์ ดำเนินธุรกิจอะไหล่ยนต์และอุปกรณ์ตกแต่งรถยนต์ครบวงจร มีสาขาทั่วประเทศ ให้วงเงินสินเชื่อพิเศษ 250,000 บาท เงื่อนไขเครดิตเทอม 60 วัน",
 		},
 		{
 			"CustomerCode":  "CUST-003",
@@ -108,6 +113,8 @@ func main() {
 			{Name: "UnitPrice", Type: accdb.ColTypeDouble, Nullable: false},
 			{Name: "StockQty", Type: accdb.ColTypeLongInt, Nullable: false},
 			{Name: "InStock", Type: accdb.ColTypeBoolean, Nullable: false},
+			{Name: "Description", Type: accdb.ColTypeMemo, Nullable: true},
+			{Name: "Image", Type: accdb.ColTypeOLE, Nullable: true},
 		},
 		Indexes: []accdb.IndexDef{
 			{Name: "PK_Products", Columns: []string{"ProductID"}, Primary: true, Unique: true},
@@ -126,6 +133,8 @@ func main() {
 			"UnitPrice":   220.0,
 			"StockQty":    int32(150),
 			"InStock":     true,
+			"Description": "ข้าวหอมมะลิคุณภาพคัดพิเศษ เมล็ดเรียวยาว หอมนุ่ม หุงขึ้นหม้อ มาตรฐานส่งออก",
+			"Image":       []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01},
 		},
 		{
 			"SKU":         "BEV-COF-250",
@@ -134,6 +143,7 @@ func main() {
 			"UnitPrice":   185.50,
 			"StockQty":    int32(80),
 			"InStock":     true,
+			"Description": "เมล็ดกาแฟสายพันธุ์อาราบิก้าแท้จากดอยช้าง ปลูกบนความสูงกว่า 1,200 เมตร คั่วระดับกลาง กลิ่นหอมละมุน รสชาติกลมกล่อม",
 		},
 		{
 			"SKU":         "ELEC-MON-27",
@@ -142,6 +152,9 @@ func main() {
 			"UnitPrice":   8900.0,
 			"StockQty":    int32(25),
 			"InStock":     true,
+			// Long memo (> 4096 bytes) to demonstrate multi-chunk chained storage
+			"Description": strings.Repeat("จอแสดงผลระดับมืออาชีพ 4K UHD 3840x2160 รองรับ HDR400 ขอบเขตสี 99% sRGB พอร์ตเชื่อมต่อ HDMI 2.1, DisplayPort 1.4 และ Type-C PD 65W รับประกันศูนย์ 3 ปีเต็ม พร้อมบริการ Onsite Service ทั่วประเทศ\n", 30),
+			"Image":       bytes.Repeat([]byte{0xDE, 0xAD, 0xBE, 0xEF}, 1024), // 4KB OLE binary
 		},
 		{
 			"SKU":         "OFFC-CHR-01",
@@ -150,6 +163,7 @@ func main() {
 			"UnitPrice":   5400.0,
 			"StockQty":    int32(0),
 			"InStock":     false,
+			"Description": "เก้าอี้เพื่อสุขภาพตามหลักการยศาสตร์ ปรับระดับพนักพิงหลัง ที่รองคอ และที่วางแขนได้ 3D ผ้าระบายอากาศ Mesh ไม่อับชื้น",
 		},
 	}
 
@@ -197,13 +211,18 @@ func main() {
 	}
 	for custIter.Next() {
 		row := custIter.Row()
-		fmt.Printf("  [%d] %s: %s (Contact: %s, Credit: %.2f, Active: %v)\n",
+		notes := row.GetString("Notes")
+		notesRunes := []rune(notes)
+		if len(notesRunes) > 30 {
+			notes = string(notesRunes[:30]) + "..."
+		}
+		fmt.Printf("  [%d] %s: %s (Credit: %.2f, Active: %v, Notes: %q)\n",
 			row.GetInt("ID"),
 			row.GetString("CustomerCode"),
 			row.GetString("CompanyName"),
-			row.GetString("ContactPerson"),
 			row.GetFloat("CreditLimit"),
 			row.GetBool("Active"),
+			notes,
 		)
 	}
 
@@ -229,13 +248,20 @@ func main() {
 	}
 	for prodIter.Next() {
 		row := prodIter.Row()
-		fmt.Printf("  [%d] %s: %s (Category: %s, Price: %.2f, Stock: %d)\n",
+		desc := row.GetString("Description")
+		descRunes := []rune(desc)
+		if len(descRunes) > 35 {
+			desc = fmt.Sprintf("%s... (Total %d chars)", string(descRunes[:35]), len(descRunes))
+		}
+		imgBytes := row.GetBytes("Image")
+		fmt.Printf("  [%d] %s: %s (Price: %.2f, Stock: %d, ImageLen: %d B)\n       Desc: %s\n",
 			row.GetInt("ProductID"),
 			row.GetString("SKU"),
 			row.GetString("ProductName"),
-			row.GetString("Category"),
 			row.GetFloat("UnitPrice"),
 			row.GetInt("StockQty"),
+			len(imgBytes),
+			desc,
 		)
 	}
 

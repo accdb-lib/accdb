@@ -756,6 +756,22 @@ func (db *Database) DropTable(name string) error {
 			return fmt.Errorf("%w: cannot drop system table %s", ErrInvalidData, tbl.Name)
 		}
 
+		// Free external long value chains referenced by table rows
+		hasLongVal := false
+		for _, col := range tbl.Columns {
+			if col.Type == ColTypeMemo || col.Type == ColTypeOLE {
+				hasLongVal = true
+				break
+			}
+		}
+		if hasLongVal {
+			if rIter, err := tbl.Rows(); err == nil {
+				for rIter.Next() {
+					tbl.freeRowLongValues(rIter.Row().Location())
+				}
+			}
+		}
+
 		// 3 & 4. Remove child metadata from MSysObjects (ParentId == tbl.ID)
 		sysObjects, err := working.Table("MSysObjects")
 		if err == nil && sysObjects != nil {

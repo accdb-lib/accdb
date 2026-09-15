@@ -218,12 +218,13 @@ func (table *Table) parseRowAt(page []byte, pageNum uint32, rowNum int, hops int
 	}
 
 	// Fixed-length columns
-	for i, col := range table.Columns {
+	for _, col := range table.Columns {
 		if isVariableLength(col.Type) {
 			continue
 		}
 
-		if i >= storedColumnCount || !nullBit(nullMask, i) {
+		colID := int(col.Index)
+		if colID >= storedColumnCount || !nullBit(nullMask, colID) {
 			row.Values[col.Name] = nil
 			continue
 		}
@@ -246,33 +247,42 @@ func (table *Table) parseRowAt(page []byte, pageNum uint32, rowNum int, hops int
 
 	if varColCount > 0 {
 		trailerStart := len(rowData) - nullMaskSize
-		if trailerStart < 2 || int(readUint16(rowData, trailerStart-2)) < varColCount {
+		if trailerStart < 2 {
 			return nil, ErrCorruptDatabase
 		}
-		varIndex := 0
-		for i, col := range table.Columns {
+		numVarColsInRow := int(readUint16(rowData, trailerStart-2))
+		for _, col := range table.Columns {
 			if !isVariableLength(col.Type) {
 				continue
 			}
 
-			if i >= storedColumnCount || !nullBit(nullMask, i) {
+			colID := int(col.Index)
+			if colID >= storedColumnCount || !nullBit(nullMask, colID) {
 				row.Values[col.Name] = nil
-				varIndex++
 				continue
 			}
 
-			offsetPos := trailerStart - 4 - varIndex*2
-			if offsetPos < 2 {
+			varIdx := int(col.Offset)
+			if varIdx >= numVarColsInRow {
+				row.Values[col.Name] = nil
+				continue
+			}
+
+			offsetPos := trailerStart - 4 - varIdx*2
+			if offsetPos-2 < 2 {
 				return nil, ErrCorruptDatabase
 			}
 			start := int(readUint16(rowData, offsetPos))
 			end := int(readUint16(rowData, offsetPos-2))
 			if start <= end && end <= len(rowData) {
-				row.Values[col.Name] = readVariableValue(rowData[start:end], col)
+				val, err := readVariableValue(table.db, rowData[start:end], col)
+				if err != nil {
+					return nil, err
+				}
+				row.Values[col.Name] = val
 			} else {
 				return nil, ErrCorruptDatabase
 			}
-			varIndex++
 		}
 	}
 
@@ -313,20 +323,49 @@ func readColumnValue(data []byte, col *Column) (interface{}, int) {
 }
 
 // readVariableValue reads a variable-length column value
-func readVariableValue(data []byte, col *Column) interface{} {
+func readVariableValue(db *Database, data []byte, col *Column) (interface{}, error) {
 	switch col.Type {
-	case ColTypeText, ColTypeMemo:
+	case ColTypeText:
 		if len(data) >= 2 && data[0] == 0xFF && data[1] == 0xFE {
-			return string(data[2:])
+			return string(data[2:]), nil
 		}
-		// UTF-16
-		return readUTF16String(data, 0, len(data))
-	case ColTypeBinary, ColTypeOLE:
+		return readUTF16String(data, 0, len(data)), nil
+
+	case ColTypeMemo:
+		if len(data) == 0 {
+			return "", nil
+		}
+		desc, err := parseLongValueDescriptor(data)
+		if err != nil {
+			return nil, err
+		}
+		rawBytes, err := readLongValue(db, desc)
+		if err != nil {
+			return nil, err
+		}
+		return decodeLongText(rawBytes), nil
+
+	case ColTypeBinary:
 		result := make([]byte, len(data))
 		copy(result, data)
-		return result
+		return result, nil
+
+	case ColTypeOLE:
+		if len(data) == 0 {
+			return []byte{}, nil
+		}
+		desc, err := parseLongValueDescriptor(data)
+		if err != nil {
+			return nil, err
+		}
+		rawBytes, err := readLongValue(db, desc)
+		if err != nil {
+			return nil, err
+		}
+		return rawBytes, nil
+
 	default:
-		return data
+		return data, nil
 	}
 }
 
@@ -506,10 +545,10 @@ func (table *Table) buildRowData(values map[string]interface{}) ([]byte, error) 
 		}
 	}
 	fixedData := make([]byte, fixedSize)
-	for i, col := range table.Columns {
+	for _, col := range table.Columns {
 		v, exists := values[col.Name]
 		if exists && v != nil {
-			setNullBit(nullMask, i, true)
+			setNullBit(nullMask, int(col.Index), true)
 		}
 		if isVariableLength(col.Type) {
 			continue
@@ -538,7 +577,7 @@ func (table *Table) buildRowData(values map[string]interface{}) ([]byte, error) 
 			continue
 		}
 
-		data, err := encodeVariableValue(col, v)
+		data, err := encodeVariableValue(table.db, col, v)
 		if err != nil {
 			return nil, err
 		}
@@ -679,12 +718,12 @@ func writeColumnValue(buf *bytes.Buffer, col *Column, v interface{}) error {
 }
 
 // encodeVariableValue encodes a variable-length value
-func encodeVariableValue(col *Column, v interface{}) ([]byte, error) {
+func encodeVariableValue(db *Database, col *Column, v interface{}) ([]byte, error) {
 	if err := validateColumnValue(col, v); err != nil {
 		return nil, err
 	}
 	switch col.Type {
-	case ColTypeText, ColTypeMemo:
+	case ColTypeText:
 		var s string
 		switch val := v.(type) {
 		case string:
@@ -705,13 +744,44 @@ func encodeVariableValue(col *Column, v interface{}) ([]byte, error) {
 			return append([]byte{0xFF, 0xFE}, []byte(s)...), nil
 		}
 		return writeUTF16String(s, len([]rune(s))*2), nil
-	case ColTypeBinary, ColTypeOLE:
+
+	case ColTypeMemo:
+		var s string
+		switch val := v.(type) {
+		case string:
+			s = val
+		case []byte:
+			s = string(val)
+		default:
+			s = fmt.Sprint(v)
+		}
+		encoded := encodeLongText(s)
+		desc, err := writeLongValue(db, encoded)
+		if err != nil {
+			return nil, err
+		}
+		return encodeLongValueDescriptor(desc), nil
+
+	case ColTypeBinary:
 		switch val := v.(type) {
 		case []byte:
 			return val, nil
 		default:
 			return nil, fmt.Errorf("binary column requires []byte")
 		}
+
+	case ColTypeOLE:
+		switch val := v.(type) {
+		case []byte:
+			desc, err := writeLongValue(db, val)
+			if err != nil {
+				return nil, err
+			}
+			return encodeLongValueDescriptor(desc), nil
+		default:
+			return nil, fmt.Errorf("OLE column requires []byte")
+		}
+
 	default:
 		return nil, fmt.Errorf("unsupported variable type: %d", col.Type)
 	}
@@ -1076,6 +1146,103 @@ func rebuildDataPageWithFlags(page []byte, replacementRow int, replacementData [
 	return newPage, nil
 }
 
+func (table *Table) freeRowLongValues(loc RowLocation) {
+	if table == nil || table.db == nil || loc.PageNumber == 0 {
+		return
+	}
+	start, end, err := pageBounds(loc.PageNumber, table.db.pageSize, len(table.db.data))
+	if err != nil {
+		return
+	}
+	page := table.db.data[start:end]
+	recCount := int(readUint16(page, 12))
+	if int(loc.RowNumber) >= recCount {
+		return
+	}
+
+	slotPos := 14 + int(loc.RowNumber)*2
+	rawOffset := readUint16(page, slotPos)
+	if (rawOffset&rowDeletedMask != 0) && (rawOffset&rowOverflowMask != 0) {
+		return
+	}
+
+	isOverflowPointer := (rawOffset&rowOverflowMask != 0) && (rawOffset&rowDeletedMask == 0)
+	offset := int(rawOffset & rowOffsetMask)
+
+	var rowData []byte
+	if isOverflowPointer && offset > 0 && offset+4 <= len(page) {
+		targetRowNum := int(page[offset])
+		targetPageNum := uint32(page[offset+1]) | (uint32(page[offset+2]) << 8) | (uint32(page[offset+3]) << 16)
+		oStart, oEnd, err := pageBounds(targetPageNum, table.db.pageSize, len(table.db.data))
+		if err == nil {
+			oPage := table.db.data[oStart:oEnd]
+			oCount := int(readUint16(oPage, 12))
+			if targetRowNum < oCount {
+				oSlot := 14 + targetRowNum*2
+				oRaw := readUint16(oPage, oSlot)
+				oOffset := int(oRaw & rowOffsetMask)
+				oEndOffset := table.db.pageSize
+				if targetRowNum > 0 {
+					oEndOffset = int(readUint16(oPage, 14+(targetRowNum-1)*2) & rowOffsetMask)
+				}
+				if oOffset >= 14+oCount*2 && oOffset <= oEndOffset && oEndOffset <= len(oPage) {
+					rowData = oPage[oOffset:oEndOffset]
+				}
+			}
+		}
+	} else {
+		rowEnd := table.db.pageSize
+		if loc.RowNumber > 0 {
+			rowEnd = int(readUint16(page, 14+int(loc.RowNumber-1)*2) & rowOffsetMask)
+		}
+		if offset >= 14+recCount*2 && offset <= rowEnd && rowEnd <= len(page) {
+			rowData = page[offset:rowEnd]
+		}
+	}
+
+	if len(rowData) < 4 {
+		return
+	}
+
+	storedColumnCount := int(readUint16(rowData, 0))
+	nullMaskSize := (storedColumnCount + 7) / 8
+	if len(rowData) < 2+nullMaskSize {
+		return
+	}
+	nullMask := rowData[len(rowData)-nullMaskSize:]
+	trailerStart := len(rowData) - nullMaskSize
+	if trailerStart < 2 {
+		return
+	}
+	numVarCols := int(readUint16(rowData, trailerStart-2))
+
+	for _, col := range table.Columns {
+		if col.Type != ColTypeMemo && col.Type != ColTypeOLE {
+			continue
+		}
+		colID := int(col.Index)
+		if colID >= storedColumnCount || !nullBit(nullMask, colID) {
+			continue
+		}
+		varIdx := int(col.Offset)
+		if varIdx >= numVarCols {
+			continue
+		}
+		offsetPos := trailerStart - 4 - varIdx*2
+		if offsetPos-2 < 2 {
+			continue
+		}
+		start := int(readUint16(rowData, offsetPos))
+		end := int(readUint16(rowData, offsetPos-2))
+		if start < end && end <= len(rowData) && (end-start) >= 12 {
+			desc, err := parseLongValueDescriptor(rowData[start:end])
+			if err == nil {
+				_ = freeLongValue(table.db, desc)
+			}
+		}
+	}
+}
+
 func (table *Table) deleteAt(loc RowLocation) error {
 	db := table.db
 	if db == nil {
@@ -1109,6 +1276,8 @@ func (table *Table) deleteAt(loc RowLocation) error {
 	if deleted {
 		return ErrRowNotFound
 	}
+
+	table.freeRowLongValues(loc)
 
 	isOverflowPointer := (rawOffset&rowOverflowMask != 0) && (rawOffset&rowDeletedMask == 0)
 	offset := int(rawOffset & rowOffsetMask)
@@ -1301,6 +1470,7 @@ func (table *Table) updateInternal(values map[string]interface{}, where func(*Ro
 	}
 
 	for i, cand := range candidates {
+		table.freeRowLongValues(cand.loc)
 		newData, err := table.buildRowData(cand.newValues)
 		if err != nil {
 			return 0, err

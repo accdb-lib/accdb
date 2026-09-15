@@ -8,6 +8,10 @@ See [docs/architecture.md](docs/architecture.md) for full architectural specific
 3. **Defense Against Corrupted Input**: Binary decoders must return errors or safe values instead of panicking on out-of-bounds offsets.
 4. **Isolated Tests**: Tests must use `t.TempDir()` rather than creating files in the repository root.
 5. **Git Hygiene**: Keep binary `.accdb`, `.mdb`, and OS metadata out of Git tracking.
+6. **Secret & Credential Leak Prevention (Zero Secrets in Git)**:
+   - Always verify `git diff` and run an automated secret scan before committing or pushing.
+   - Never commit API keys, access tokens, credentials, passwords, private keys (`.pem`, `.key`, `id_rsa`), certificates, or `.env` files.
+   - Never commit hardcoded user-specific machine paths (e.g. `/Users/<username>/...`). Use `os.UserHomeDir()`, relative paths, or environment variables instead.
 
 ## Core Storage Invariants
 - **Multi-Page Iteration**: `RowIterator` walks all entries in `table.DataPages` and resets `rowIndex = 0` between pages.
